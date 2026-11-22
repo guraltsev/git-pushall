@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""git-pushall: find git repositories and push every branch that is ahead of
+its upstream, but only when the push is a fast-forward.
+
+Usage:
+    git-pushall [DIR ...] [--fetch | --no-fetch | --fetch=true|false]
+                [--pull | --no-pull | --pull=true|false] [-n]
+    git-pushall --install [--force]
+
+Configuration: $XDG_CONFIG_HOME/git-pushall/config.toml (default
+~/.config/git-pushall/config.toml). It is created, fully commented out, on
+first run. Command-line options override it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover
+    try:
+        import tomli as tomllib  # type: ignore
+    except ModuleNotFoundError:
+        sys.exit("git-pushall: needs Python 3.11+ (or the 'tomli' package)")
+
+PROG = "git-pushall"
+# --install uses this string to recognise an older copy of itself.
+MARKER = "git-pushall: find git repositories and push every branch"
+
+DEFAULTS: dict = {
+    "roots": ["~"],
+    "exclude": ["node_modules", "__pycache__", ".venv", "venv", "site-packages"],
+    "skip_hidden": True,
+    "max_depth": 0,
+    "follow_symlinks": False,
+    "remote_patterns": [],
+    "fetch": True,
+    "fetch_timeout": 60,
+    "push": True,
+    "push_timeout": 120,
+    "push_new_branches": False,
+    "new_branch_remote": "origin",
+    "skip_dirty": False,
+    "pull": False,
+    "jobs": 8,
+    "color": "auto",
+}
+
+TRUE_WORDS = {"1", "true", "yes", "on", "y"}
+FALSE_WORDS = {"0", "false", "no", "off", "n"}
+
+
+# ───────────────────────────── config ──────────────────────────────
+
+
+def toml_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    raise TypeError(v)
+
+
+def config_template() -> str:
+    d = {k: toml_value(v) for k, v in DEFAULTS.items()}
+    return f"""\
+# {PROG} configuration
+#
+# Every setting is commented out and shows its built-in default. To change a
+# default, uncomment the line and edit the value. Command-line options always
+# win over this file. The file is TOML: strings in "double quotes", lists in
+# [brackets], booleans are true/false. Delete this file to regenerate it.
+
+# ─── Where to look ──────────────────────────────────────────────────────
+
+# Directories searched (recursively) for git repositories. "~" is expanded.
+# Directories given on the command line replace this list.
+# roots = {d['roots']}
+
+# Directories not to descend into. Each entry is a glob pattern, matched
+# against the directory's name, its path relative to the root, and its
+# absolute path ("~" is expanded), e.g. "build", "work/*", "~/scratch/*".
+# exclude = {d['exclude']}
+
+# Do not descend into hidden directories (name starts with "."), e.g. ~/.cache
+# or ~/.local. Set to false if you keep repos in hidden directories such as
+# ~/.dotfiles. A root you list explicitly is always searched.
+# skip_hidden = {d['skip_hidden']}
+
+# Maximum depth below each root to search (0 = unlimited; the root is 0).
+# max_depth = {d['max_depth']}
+
+# Follow symlinks to directories while searching. A repository reachable by
+# several paths is processed only once.
+# follow_symlinks = {d['follow_symlinks']}
+
+# Searching never descends into a repository, so nested repos and submodules
+# inside a repository are not processed separately.
+
+# ─── Which remotes count ────────────────────────────────────────────────
+
+# Only consider remotes whose push URL matches one of these glob patterns,
+# e.g. ["*github.com*"] or ["git@github.com:yourname/*",
+# "https://github.com/yourname/*"]. Branches tracking other remotes are left
+# alone; repositories with no matching remote are counted as "ignored".
+# An empty list means every remote counts.
+# remote_patterns = {d['remote_patterns']}
+
+# ─── Fetching ───────────────────────────────────────────────────────────
+
+# Fetch (with --prune) the relevant remotes before comparing branches.
+# Same as --fetch / --no-fetch / --fetch=true|false. Without fetching, the
+# ahead/behind check uses what git last saw of the remote; git itself still
+# refuses a non-fast-forward push, so it stays safe, just less informative.
+# fetch = {d['fetch']}
+
+# Seconds before fetching one repository is abandoned (0 = no limit).
+# fetch_timeout = {d['fetch_timeout']}
+
+# ─── Pushing ────────────────────────────────────────────────────────────
+
+# Actually push. false = only report what would be pushed (same as -n).
+# push = {d['push']}
+
+# Seconds before pushing one branch is abandoned (0 = no limit).
+# push_timeout = {d['push_timeout']}
+
+# Branches without an upstream are normally reported as skipped. When true,
+# they are pushed to new_branch_remote under the same name and that becomes
+# their upstream (like "git push -u"). If the remote already has a branch of
+# that name, the fast-forward rule still applies.
+# push_new_branches = {d['push_new_branches']}
+# new_branch_remote = {d['new_branch_remote']}
+
+# Only committed work is ever pushed. When true, repositories with
+# uncommitted changes or untracked files are skipped entirely; when false
+# they are pushed anyway and the dirty state is listed under "Notes".
+# skip_dirty = {d['skip_dirty']}
+
+# Branches are only pushed when the remote branch is an ancestor of the
+# local one (a fast-forward). Diverged branches are always skipped; there
+# is deliberately no force option.
+
+# ─── Pulling ────────────────────────────────────────────────────────────
+
+# Also bring branches up to date when the upstream is ahead (same as --pull /
+# --no-pull / --pull=true|false). Only fast-forwards, never a merge commit or
+# rebase:
+#   * the checked-out branch is fast-forwarded (git merge --ff-only) only if
+#     the working tree is completely clean (no modified or untracked files)
+#     and no merge/rebase/cherry-pick is in progress; otherwise it is skipped;
+#   * other local branches are fast-forwarded without checking them out.
+# Diverged branches are skipped. When false, branches behind their upstream
+# are just listed under "Notes". -n / push = false also turns pulls into a
+# report of what would be pulled.
+# pull = {d['pull']}
+
+# ─── Behaviour ──────────────────────────────────────────────────────────
+
+# Number of repositories processed in parallel (same as -j).
+# jobs = {d['jobs']}
+
+# Coloured output: "auto" (only on a terminal), "always" or "never".
+# color = {d['color']}
+"""
+
+
+def config_path(explicit: Path | None) -> Path:
+    if explicit:
+        return explicit.expanduser()
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / PROG / "config.toml"
+
+
+def ensure_config(path: Path) -> None:
+    if path.exists():
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(config_template(), encoding="utf-8")
+        print(f"{PROG}: wrote default config to {path}", file=sys.stderr)
+    except OSError as e:
+        print(f"{PROG}: could not write default config {path}: {e}", file=sys.stderr)
+
+
+def load_config(path: Path) -> dict:
+    ensure_config(path)
+    cfg = dict(DEFAULTS)
+    if not path.exists():
+        return cfg
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        die(f"{path}: {e}")
+    for key, val in data.items():
+        if key not in DEFAULTS:
+            print(f"{PROG}: {path}: unknown setting '{key}' ignored", file=sys.stderr)
+            continue
+        default = DEFAULTS[key]
+        if isinstance(default, list):
+            ok = isinstance(val, list) and all(isinstance(x, str) for x in val)
+            want = "a list of strings"
+        else:
+            ok = type(val) is type(default)
+            want = {bool: "true/false", int: "an integer", str: "a string"}[type(default)]
+        if not ok:
+            die(f"{path}: '{key}' must be {want}")
+        cfg[key] = val
+    if cfg["color"] not in ("auto", "always", "never"):
+        die(f"{path}: 'color' must be \"auto\", \"always\" or \"never\"")
+    for key in ("max_depth", "fetch_timeout", "push_timeout"):
+        if cfg[key] < 0:
+            die(f"{path}: '{key}' must be >= 0")
+    if cfg["jobs"] < 1:
+        die(f"{path}: 'jobs' must be >= 1")
+    return cfg
+
+
+def die(msg: str, code: int = 2):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ───────────────────────────── git ─────────────────────────────────
+
+GIT_ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+_procs: set[subprocess.Popen] = set()
+_procs_lock = threading.Lock()
+
+
+class GitTimeout(Exception):
+    pass
+
+
+def git(repo: Path, *args: str, timeout: int = 0) -> subprocess.CompletedProcess:
+    cmd = ["git", "-C", str(repo), *args]
+    # New session: git/ssh cannot open the terminal to ask for passwords,
+    # and the whole process group can be killed on timeout.
+    p = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", env=GIT_ENV, start_new_session=True,
+    )
+    with _procs_lock:
+        _procs.add(p)
+    try:
+        out, err = p.communicate(timeout=timeout or None)
+    except subprocess.TimeoutExpired:
+        kill(p)
+        p.communicate()
+        raise GitTimeout(f"timed out after {timeout}s")
+    finally:
+        with _procs_lock:
+            _procs.discard(p)
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+def kill(p: subprocess.Popen) -> None:
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def kill_all() -> None:
+    with _procs_lock:
+        for p in list(_procs):
+            kill(p)
+
+
+def last_line(text: str) -> str:
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return "unknown error"
+    for prefix in ("fatal: ", "error: "):
+        for l in lines:
+            if l.startswith(prefix):
+                return l[len(prefix):]
+    return lines[-1]
+
+
+# ─────────────────────────── discovery ─────────────────────────────
+
+
+def find_repos(roots: list[str], cfg: dict) -> list[Path]:
+    seen: set[Path] = set()
+    repos: list[Path] = []
+    patterns = cfg["exclude"]
+    expanded = [os.path.expanduser(p) for p in patterns]
+
+    def excluded(name: str, rel: str, full: str) -> bool:
+        return any(
+            fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(full, ex)
+            for pat, ex in zip(patterns, expanded)
+        )
+
+    for r in roots:
+        root = Path(os.path.expanduser(r)).absolute()
+        if not root.is_dir():
+            print(f"{PROG}: not a directory, skipped: {r}", file=sys.stderr)
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=cfg["follow_symlinks"]):
+            here = Path(dirpath)
+            if ".git" in dirnames or ".git" in filenames:
+                real = here.resolve()
+                if real not in seen:
+                    seen.add(real)
+                    repos.append(here)
+                dirnames[:] = []
+                continue
+            depth = len(here.relative_to(root).parts)
+            if cfg["max_depth"] and depth >= cfg["max_depth"]:
+                dirnames[:] = []
+                continue
+            keep = []
+            for d in dirnames:
+                if cfg["skip_hidden"] and d.startswith("."):
+                    continue
+                full = here / d
+                if excluded(d, str(full.relative_to(root)), str(full)):
+                    continue
+                keep.append(d)
+            dirnames[:] = sorted(keep)
+    return sorted(repos)
+
+
+# ─────────────────────────── per repo ──────────────────────────────
+
+
+@dataclass
+class Result:
+    repo: Path
+    pushed: list[str] = field(default_factory=list)
+    pulled: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    ignored: bool = False
+
+    @property
+    def clean(self) -> bool:
+        return not (self.pushed or self.pulled or self.skipped or self.errors or self.notes or self.ignored)
+
+
+def ahead_behind(repo: Path, local: str, remote: str) -> tuple[int, int]:
+    r = git(repo, "rev-list", "--left-right", "--count", f"{local}...{remote}")
+    if r.returncode != 0:
+        raise RuntimeError(last_line(r.stderr))
+    a, b = r.stdout.split()
+    return int(a), int(b)
+
+
+def ref_exists(repo: Path, ref: str) -> bool:
+    return git(repo, "rev-parse", "--verify", "--quiet", ref).returncode == 0
+
+
+def do_push(repo: Path, res: Result, branch: str, remote: str, dest: str,
+            ahead: int, cfg: dict, set_upstream: bool = False) -> None:
+    what = f"{branch} → {remote}/{dest.removeprefix('refs/heads/')}"
+    what += f" ({ahead} commit{'s' if ahead != 1 else ''})" if ahead else " (new branch)"
+    if not cfg["push"]:
+        res.pushed.append(what)
+        return
+    args = ["push", "--porcelain"] + (["-u"] if set_upstream else [])
+    args += [remote, f"refs/heads/{branch}:{dest}"]
+    try:
+        r = git(repo, *args, timeout=cfg["push_timeout"])
+    except GitTimeout as e:
+        res.errors.append(f"{branch}: push {e}")
+        return
+    if r.returncode == 0:
+        res.pushed.append(what)
+        return
+    text = r.stdout + r.stderr
+    if "non-fast-forward" in text or "fetch first" in text or "[rejected]" in text:
+        res.skipped.append(f"{branch}: remote has commits you don't have (push rejected, not a fast-forward)")
+    else:
+        res.errors.append(f"{branch}: push failed: {last_line(r.stderr or r.stdout)}")
+
+
+IN_PROGRESS = {
+    "MERGE_HEAD": "merge", "rebase-merge": "rebase", "rebase-apply": "rebase/am",
+    "CHERRY_PICK_HEAD": "cherry-pick", "REVERT_HEAD": "revert", "BISECT_LOG": "bisect",
+}
+
+
+def operation_in_progress(repo: Path) -> str | None:
+    for name, what in IN_PROGRESS.items():
+        r = git(repo, "rev-parse", "--git-path", name)
+        p = Path(r.stdout.strip())
+        if r.returncode == 0 and (p if p.is_absolute() else repo / p).exists():
+            return what
+    return None
+
+
+def do_pull(repo: Path, res: Result, branch: str, upstream: str, behind: int,
+            current: str | None, dirty: bool, cfg: dict) -> None:
+    short = upstream.removeprefix("refs/remotes/")
+    what = f"{branch} ← {short} ({behind} commit{'s' if behind != 1 else ''})"
+    if branch == current:
+        if dirty:
+            res.skipped.append(f"{branch}: behind {short} by {behind}, not pulled: "
+                               "working tree has uncommitted/untracked files")
+            return
+        op = operation_in_progress(repo)
+        if op:
+            res.skipped.append(f"{branch}: behind {short} by {behind}, not pulled: {op} in progress")
+            return
+        args = ["merge", "--ff-only", "--quiet", upstream]
+    else:
+        # Updates a branch that is not checked out; git refuses non-fast-forwards
+        # (and branches checked out in another worktree).
+        args = ["fetch", "--quiet", ".", f"{upstream}:refs/heads/{branch}"]
+    if not cfg["push"]:
+        res.pulled.append(what)
+        return
+    r = git(repo, *args)
+    if r.returncode == 0:
+        res.pulled.append(what)
+    else:
+        res.skipped.append(f"{branch}: pull failed: {last_line(r.stderr or r.stdout)}")
+
+
+def process(repo: Path, cfg: dict) -> Result:
+    res = Result(repo)
+    try:
+        _process(repo, cfg, res)
+    except GitTimeout as e:
+        res.errors.append(str(e))
+    except Exception as e:  # keep going with other repos no matter what
+        res.errors.append(f"{type(e).__name__}: {e}")
+    return res
+
+
+def _process(repo: Path, cfg: dict, res: Result) -> None:
+    r = git(repo, "remote")
+    if r.returncode != 0:
+        res.errors.append(f"not usable: {last_line(r.stderr)}")
+        return
+    remotes = r.stdout.split()
+    if cfg["remote_patterns"]:
+        relevant = []
+        for name in remotes:
+            u = git(repo, "remote", "get-url", "--push", name)
+            url = u.stdout.strip()
+            if any(fnmatch.fnmatch(url, pat) for pat in cfg["remote_patterns"]):
+                relevant.append(name)
+        if not relevant:
+            res.ignored = True
+            return
+    else:
+        relevant = remotes
+        if not remotes:
+            res.notes.append("no remote configured")
+
+    if cfg["fetch"] and relevant:
+        try:
+            f = git(repo, "fetch", "--prune", "--quiet", "--multiple", *relevant,
+                    timeout=cfg["fetch_timeout"])
+            if f.returncode != 0:
+                res.errors.append(f"fetch failed: {last_line(f.stderr)} (continuing with stale data)")
+        except GitTimeout as e:
+            res.errors.append(f"fetch {e} (continuing with stale data)")
+
+    st = git(repo, "status", "--porcelain")
+    if st.returncode != 0:
+        res.errors.append(f"git status failed: {last_line(st.stderr)}")
+        return
+    dirty = bool(st.stdout.strip())
+    cur = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+    current = cur.stdout.strip() if cur.returncode == 0 else None
+    if dirty:
+        n = len(st.stdout.splitlines())
+        if cfg["skip_dirty"]:
+            res.skipped.append(f"whole repo: {n} uncommitted/untracked file(s) (skip_dirty = true)")
+            return
+        res.notes.append(f"{n} uncommitted/untracked file(s) (not pushed)")
+
+    fmt = "%(refname:short)%00%(upstream)%00%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream:track)"
+    refs = git(repo, "for-each-ref", f"--format={fmt}", "refs/heads")
+    if refs.returncode != 0:
+        res.errors.append(f"listing branches failed: {last_line(refs.stderr)}")
+        return
+
+    for line in refs.stdout.splitlines():
+        branch, upstream, remote, remote_ref, track = line.split("\0")
+
+        if not upstream:
+            if not relevant:
+                continue
+            if not cfg["push_new_branches"]:
+                res.skipped.append(f"{branch}: no upstream branch (git push -u <remote> {branch})")
+                continue
+            remote = cfg["new_branch_remote"]
+            if remote not in relevant:
+                res.skipped.append(f"{branch}: no upstream, and new_branch_remote '{remote}' "
+                                   f"is not a {'matching ' if cfg['remote_patterns'] else ''}remote")
+                continue
+            tracking = f"refs/remotes/{remote}/{branch}"
+            if ref_exists(repo, tracking):
+                ahead, behind = ahead_behind(repo, branch, tracking)
+                if behind:
+                    res.skipped.append(f"{branch}: {remote}/{branch} already exists and has diverged "
+                                       f"({ahead} ahead, {behind} behind)")
+                    continue
+                if not ahead:
+                    git(repo, "branch", f"--set-upstream-to={remote}/{branch}", branch)
+                    continue
+            else:
+                ahead = 0
+            do_push(repo, res, branch, remote, f"refs/heads/{branch}", ahead, cfg, set_upstream=True)
+            continue
+
+        if not upstream.startswith("refs/remotes/") or remote not in relevant:
+            continue  # tracks a local branch or a remote we don't care about
+        if "gone" in track:
+            res.skipped.append(f"{branch}: upstream {upstream.removeprefix('refs/remotes/')} "
+                               "was deleted on the remote")
+            continue
+        ahead, behind = ahead_behind(repo, branch, upstream)
+        if ahead and behind:
+            res.skipped.append(f"{branch}: diverged from {upstream.removeprefix('refs/remotes/')} "
+                               f"({ahead} ahead, {behind} behind) — not a fast-forward")
+        elif ahead:
+            do_push(repo, res, branch, remote, remote_ref, ahead, cfg)
+        elif behind and cfg["pull"]:
+            do_pull(repo, res, branch, upstream, behind, current, dirty, cfg)
+        elif behind:
+            res.notes.append(f"{branch}: behind {upstream.removeprefix('refs/remotes/')} "
+                             f"by {behind} (pull needed)")
+
+
+# ─────────────────────────── output ────────────────────────────────
+
+
+class Style:
+    def __init__(self, enabled: bool):
+        self.on = enabled
+
+    def _c(self, code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if self.on else s
+
+    def bold(self, s): return self._c("1", s)
+    def green(self, s): return self._c("32", s)
+    def yellow(self, s): return self._c("33", s)
+    def red(self, s): return self._c("31", s)
+    def dim(self, s): return self._c("2", s)
+
+
+def pretty(p: Path) -> str:
+    home = str(Path.home())
+    s = str(p)
+    return "~" + s[len(home):] if s == home or s.startswith(home + "/") else s
+
+
+def report_repo(res: Result, st: Style, verbose: bool) -> list[str]:
+    out = []
+    for x in res.pushed:
+        out.append(st.green("  pushed  ") + x)
+    for x in res.pulled:
+        out.append(st.green("  pulled  ") + x)
+    for x in res.skipped:
+        out.append(st.yellow("  skipped ") + x)
+    for x in res.errors:
+        out.append(st.red("  error   ") + x)
+    for x in res.notes:
+        out.append(st.dim("  note    ") + x)
+    if res.ignored and verbose:
+        out.append(st.dim("  ignored (no remote matches remote_patterns)"))
+    if not out and verbose:
+        out.append(st.dim("  up to date"))
+    return out
+
+
+def summary(results: list[Result], st: Style, dry: bool) -> list[str]:
+    ignored = [r for r in results if r.ignored]
+    pushed = [r for r in results if r.pushed]
+    pulled = [r for r in results if r.pulled]
+    skipped = [r for r in results if r.skipped]
+    errors = [r for r in results if r.errors]
+    notes = [r for r in results if r.notes]
+    up_to_date = [r for r in results
+                  if not (r.ignored or r.pushed or r.pulled or r.skipped or r.errors)]
+    n_push = sum(len(r.pushed) for r in pushed)
+    n_pull = sum(len(r.pulled) for r in pulled)
+    n_skip = sum(len(r.skipped) for r in skipped)
+
+    L = ["", st.bold("Summary"),
+         f"  Repositories found: {len(results)}"
+         + (f" ({len(ignored)} ignored, no matching remote)" if ignored else ""),
+         f"  Already in sync:    {len(up_to_date)}"]
+
+    def section(title: str, rs: list[Result], attr: str, color):
+        if not rs:
+            return
+        L.append("")
+        L.append(color(title))
+        for r in rs:
+            items = getattr(r, attr)
+            L.append(f"  {pretty(r.repo)}")
+            L.extend(f"      {x}" for x in items)
+
+    verb = "Would push" if dry else "Pushed"
+    section(f"{verb}: {n_push} branch(es) in {len(pushed)} repo(s)", pushed, "pushed", st.green)
+    section(f"{'Would pull' if dry else 'Pulled'} (fast-forward): {n_pull} branch(es) "
+            f"in {len(pulled)} repo(s)", pulled, "pulled", st.green)
+    section(f"Skipped / aborted: {n_skip} in {len(skipped)} repo(s)", skipped, "skipped", st.yellow)
+    section(f"Errors in {len(errors)} repo(s)", errors, "errors", st.red)
+    section(f"Notes ({len(notes)} repo(s))", notes, "notes", st.dim)
+    if not (pushed or pulled or skipped or errors):
+        L.append("")
+        behind = any(": behind " in n for r in notes for n in r.notes)
+        L.append(st.green("Everything is pushed (some branches are behind; see Notes)."
+                          if behind else "Everything is in sync."))
+    return L
+
+
+# ─────────────────────────── install ───────────────────────────────
+
+
+def install(force: bool, cfg_path: Path) -> int:
+    src = Path(__file__).resolve()
+    dest_dir = Path.home() / ".local" / "bin"
+    dest = dest_dir / PROG
+    if dest.exists() or dest.is_symlink():
+        if dest.resolve() == src:
+            print(f"{dest} is this file already; nothing to do.")
+            ensure_config(cfg_path)
+            return 0
+        try:
+            ours = MARKER in dest.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            ours = False
+        if not ours and not force:
+            die(f"{dest} exists and is not {PROG}; rerun with --force to overwrite it")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{PROG}.tmp")
+    shutil.copyfile(src, tmp)
+    tmp.chmod(0o755)
+    os.replace(tmp, dest)
+    print(f"Installed {dest}")
+    path_dirs = [os.path.realpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if os.path.realpath(dest_dir) not in path_dirs:
+        print(f"Note: {dest_dir} is not on your PATH. Add this to your shell rc:\n"
+              f'  export PATH="$HOME/.local/bin:$PATH"')
+    print(f"Because it is named {PROG}, it also works as: git pushall")
+    ensure_config(cfg_path)
+    return 0
+
+
+# ───────────────────────────── main ────────────────────────────────
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    fixed = []
+    for a in argv:
+        if a == "--":
+            fixed.extend(argv[len(fixed):])
+            break
+        for opt in ("--fetch", "--pull"):
+            if a.startswith(opt + "="):
+                v = a.split("=", 1)[1].strip().lower()
+                if v in TRUE_WORDS:
+                    a = opt
+                elif v in FALSE_WORDS:
+                    a = "--no-" + opt[2:]
+                else:
+                    die(f"{opt} expects true or false, not '{v}'")
+        fixed.append(a)
+
+    p = argparse.ArgumentParser(
+        prog=PROG, allow_abbrev=False,
+        description="Find git repositories and push every branch that is ahead of its "
+                    "upstream, fast-forward only. Prints a summary at the end.",
+        epilog=f"Defaults come from {config_path(None)} (created on first run, "
+               "every option documented). Exit status: 0 = all pushed, "
+               "1 = something was skipped or failed, 2 = usage/config error.",
+    )
+    p.add_argument("roots", nargs="*", metavar="DIR",
+                   help="directories to search (default: 'roots' from the config, i.e. ~)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--fetch", dest="fetch", action="store_const", const=True, default=None,
+                   help="fetch remotes before comparing (default); also --fetch=true|false")
+    g.add_argument("--no-fetch", dest="fetch", action="store_const", const=False,
+                   help="don't fetch; compare against what git last saw")
+    g2 = p.add_mutually_exclusive_group()
+    g2.add_argument("--pull", dest="pull", action="store_const", const=True, default=None,
+                    help="also fast-forward branches whose upstream is ahead (checked-out "
+                         "branch only if the tree is clean); also --pull=true|false")
+    g2.add_argument("--no-pull", dest="pull", action="store_const", const=False,
+                    help="only report branches that are behind (default)")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="report what would be pushed, push nothing")
+    p.add_argument("-j", "--jobs", type=int, metavar="N", help="repositories processed in parallel")
+    p.add_argument("-c", "--config", type=Path, metavar="FILE", help="use this config file")
+    p.add_argument("--color", choices=["auto", "always", "never"])
+    p.add_argument("-v", "--verbose", action="store_true", help="also list up-to-date repos")
+    p.add_argument("-q", "--quiet", action="store_true", help="print only the summary")
+    p.add_argument("--install", action="store_true",
+                   help=f"copy this script to ~/.local/bin/{PROG} and create the config")
+    p.add_argument("--force", action="store_true",
+                   help="with --install: overwrite an unrelated file of the same name")
+    return p.parse_args(fixed)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    cfg_path = config_path(args.config)
+    if args.install:
+        return install(args.force, cfg_path)
+    if shutil.which("git") is None:
+        die("git not found on PATH")
+
+    cfg = load_config(cfg_path)
+    if args.fetch is not None:
+        cfg["fetch"] = args.fetch
+    if args.pull is not None:
+        cfg["pull"] = args.pull
+    if args.dry_run:
+        cfg["push"] = False
+    if args.jobs is not None:
+        if args.jobs < 1:
+            die("--jobs must be >= 1")
+        cfg["jobs"] = args.jobs
+    if args.color:
+        cfg["color"] = args.color
+    roots = args.roots or cfg["roots"]
+
+    color = cfg["color"] == "always" or (cfg["color"] == "auto" and sys.stdout.isatty()
+                                         and "NO_COLOR" not in os.environ)
+    st = Style(color)
+    progress = sys.stderr.isatty() and not args.quiet
+
+    repos = find_repos(roots, cfg)
+    if not repos:
+        print("No git repositories found in: " + ", ".join(roots))
+        return 0
+    mode = []
+    mode.append("fetch" if cfg["fetch"] else "no fetch")
+    if cfg["pull"]:
+        mode.append("pull")
+    if not cfg["push"]:
+        mode.append("dry run")
+    print(st.dim(f"Checking {len(repos)} repositories ({', '.join(mode)})…"))
+
+    results: list[Result] = []
+    pool = ThreadPoolExecutor(max_workers=cfg["jobs"])
+    try:
+        futures = {pool.submit(process, r, cfg): r for r in repos}
+        for i, fut in enumerate(as_completed(futures), 1):
+            res = fut.result()
+            results.append(res)
+            if progress:
+                sys.stderr.write("\r\033[2K")
+            if not args.quiet:
+                lines = report_repo(res, st, args.verbose)
+                if lines:
+                    print(st.bold(pretty(res.repo)))
+                    print("\n".join(lines))
+            if progress:
+                sys.stderr.write(f"[{i}/{len(repos)}] {pretty(res.repo)}"[:shutil.get_terminal_size().columns - 1])
+                sys.stderr.flush()
+        if progress:
+            sys.stderr.write("\r\033[2K")
+    except KeyboardInterrupt:
+        kill_all()
+        pool.shutdown(wait=False, cancel_futures=True)
+        print(f"\n{PROG}: interrupted; partial summary of {len(results)} repo(s):", file=sys.stderr)
+        results.sort(key=lambda r: r.repo)
+        print("\n".join(summary(results, st, not cfg["push"])))
+        os._exit(130)
+    pool.shutdown()
+
+    results.sort(key=lambda r: r.repo)
+    print("\n".join(summary(results, st, not cfg["push"])))
+    return 1 if any(r.skipped or r.errors for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
